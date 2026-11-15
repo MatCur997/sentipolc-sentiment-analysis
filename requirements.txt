@@ -1,0 +1,8 @@
+datasets
+emoji
+nltk
+numpy
+pandas
+# LogisticRegression(penalty=...) is deprecated in 1.8 and removed in 1.10
+scikit-learn<1.10
+stanza
