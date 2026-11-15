@@ -1,8 +1,24 @@
+"""Sentiment analysis binaria su tweet italiani (EVALITA 2016 SENTIPOLC).
+
+Pipeline: pulizia del testo con espressioni regolari, analisi sintattica con
+Stanza (lemmi e negazione propagata con il suffisso "_NEG"), rimozione delle
+stopwords di dominio contro il topic bias, confronto di quattro combinazioni
+vettorializzatore/classificatore con Grid Search e 5-fold cross-validation,
+soglia decisionale spostata a 0,70, analisi dei falsi positivi rispetto
+all'ironia e delle feature piu' influenti.
+
+Uso:
+    python main.py
+"""
+
 # 0) Importazione librerie
+
+from pathlib import Path
 
 from datasets import load_dataset
 import html
 import re
+import numpy as np
 import pandas as pd
 import emoji
 import stanza
@@ -15,18 +31,31 @@ from sklearn.pipeline import Pipeline
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import classification_report, confusion_matrix
 
+CARTELLA_RISULTATI = Path(__file__).resolve().parent / "results"
+
 
 # --------------------------------------------
 # 1) Download del dataset da Hugging Face e preparazione dei dati
-print("1) Download e preparazione dei dati")
 
-dataset = load_dataset("evalitahf/sentiment_analysis")
+def carica_dati() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Scarica SENTIPOLC 2016 da Hugging Face e restituisce train e test filtrati."""
+    print("1) Download e preparazione dei dati")
 
-df_train_raw = pd.DataFrame(dataset['train'])
-df_test_raw = pd.DataFrame(dataset['test'])
+    dataset = load_dataset("evalitahf/sentiment_analysis")
+
+    df_train_raw = pd.DataFrame(dataset['train'])
+    df_test_raw = pd.DataFrame(dataset['test'])
+
+    return pulizia_etichette(df_train_raw), pulizia_etichette(df_test_raw)
 
 
-def pulizia_etichette(df):
+def pulizia_etichette(df: pd.DataFrame) -> pd.DataFrame:
+    """Tiene solo i tweet positivi o negativi, con etichette valide.
+
+    Scarta le righe in cui `opos` o `oneg` non valgono 0 o 1, i tweet neutri
+    (0, 0) e quelli misti (1, 1). La colonna `label` vale 1 per i positivi e
+    0 per i negativi.
+    """
     # Sanity check sui valori delle colonne
     df_valid = df[df['opos'].astype(str).str.fullmatch(r'[01]') &
                    df['oneg'].astype(str).str.fullmatch(r'[01]')].copy()
@@ -42,14 +71,16 @@ def pulizia_etichette(df):
     return df_valid
 
 
-df_train = pulizia_etichette(df_train_raw)
-df_test = pulizia_etichette(df_test_raw)
-
 # --------------------------------------------
 # 2) Pulizia testuale iniziale tramite RegEx
-print("\n2) Pulizia Testuale")
 
-def pulizia_iniziale(text):
+def pulizia_iniziale(text: str) -> str:
+    """Normalizza un tweet prima dell'analisi sintattica.
+
+    Decodifica le entita' HTML, converte le emoji in testo italiano, toglie i
+    segnaposto <URL> e <MENTION_n> e i tag di retweet, trasforma gli hashtag
+    in token "htag_..." minuscoli e compatta gli spazi.
+    """
     # Decodifica HTML
     text = html.unescape(text)
 
@@ -76,16 +107,10 @@ def pulizia_iniziale(text):
 
     return text
 
-df_train['text_clean'] = df_train['text'].apply(pulizia_iniziale)
-df_test['text_clean'] = df_test['text'].apply(pulizia_iniziale)
 
 # --------------------------------------------
-# 3) Con Stanza, rimozione delle sia delle stopwords che delle stopwords di dominio;
+# 3) Con Stanza, rimozione sia delle stopwords che delle stopwords di dominio;
 #    Dependency Parsing utile alla propagazione semantica delle parole di negazione
-print("\n3) Estrazione sintattica con Stanza")
-
-nltk.download('stopwords', quiet=True)
-stop_words_it = set(stopwords.words('italian'))
 
 # 1. Definizione delle parole di negazione
 parole_negazione = {"non", "mai", "nessuno", "senza", "neanche", "nemmeno", "neppure", "né", "ne'"}
@@ -135,13 +160,24 @@ stop_words_domain = {
     "spread",  "patrimoniale", "crisi", "htag_crisi"
 }
 
-# 3. Insieme totale delle stopwords
-stop_words_it = (stop_words_it - parole_negazione - parole_avversative) | stop_words_domain
 
-# Definizione della Pipeline
-nlp = stanza.Pipeline('it', processors='tokenize,pos,lemma,depparse', use_gpu=True)
+def costruisci_stopwords() -> set[str]:
+    """Stopwords italiane di NLTK, senza negazioni e avversative, piu' quelle di dominio."""
+    nltk.download('stopwords', quiet=True)
+    stop_words_it = set(stopwords.words('italian'))
 
-def estrazione_features_doc(doc):
+    # 3. Insieme totale delle stopwords
+    return (stop_words_it - parole_negazione - parole_avversative) | stop_words_domain
+
+
+def estrazione_features_doc(doc: stanza.Document, stop_words_it: set[str]) -> str:
+    """Trasforma un tweet analizzato da Stanza nel testo passato al classificatore.
+
+    Toglie stopwords e parole di negazione, conserva gli hashtag ("htag_...")
+    e, fra i segni di punteggiatura, solo "!" e "?". Le altre parole sono
+    sostituite dal lemma. La testa sintattica di una negazione e i suoi
+    dipendenti `obj`, `xcomp` e `conj` ricevono il suffisso "_NEG".
+    """
     final_tokens = []
     for sentence in doc.sentences:
         id_negati = set()
@@ -172,7 +208,7 @@ def estrazione_features_doc(doc):
             if testo_token in parole_negazione:
                 continue
 
-            # Rimozionde della punteggiatura, eccetto "!" e "?"
+            # Rimozione della punteggiatura, eccetto "!" e "?"
             if word.upos == "PUNCT":
                 if testo_token in ["!", "?"]:
                     final_tokens.append(testo_token)
@@ -189,47 +225,48 @@ def estrazione_features_doc(doc):
 
     return " ".join(final_tokens)
 
-# Definizione di due batch, per ottimizzare i tempi
-print("Processamento del batch del train set")
-in_docs_train = [stanza.Document([], text=t) for t in df_train['text_clean'].tolist()]
-out_docs_train = nlp(in_docs_train)
-df_train['text_ready'] = [estrazione_features_doc(doc) for doc in out_docs_train]
 
-print("Processamento del batch del test set")
-in_docs_test = [stanza.Document([], text=t) for t in df_test['text_clean'].tolist()]
-out_docs_test = nlp(in_docs_test)
-df_test['text_ready'] = [estrazione_features_doc(doc) for doc in out_docs_test]
+def analisi_stanza(df_train: pd.DataFrame, df_test: pd.DataFrame) -> None:
+    """Aggiunge a train e test la colonna `text_ready`, prodotta con Stanza."""
+    print("\n3) Estrazione sintattica con Stanza")
+
+    stop_words_it = costruisci_stopwords()
+
+    # Definizione della Pipeline
+    nlp = stanza.Pipeline('it', processors='tokenize,pos,lemma,depparse', use_gpu=True)
+
+    # Definizione di due batch, per ottimizzare i tempi
+    print("Processamento del batch del train set")
+    in_docs_train = [stanza.Document([], text=t) for t in df_train['text_clean'].tolist()]
+    out_docs_train = nlp(in_docs_train)
+    df_train['text_ready'] = [estrazione_features_doc(doc, stop_words_it) for doc in out_docs_train]
+
+    print("Processamento del batch del test set")
+    in_docs_test = [stanza.Document([], text=t) for t in df_test['text_clean'].tolist()]
+    out_docs_test = nlp(in_docs_test)
+    df_test['text_ready'] = [estrazione_features_doc(doc, stop_words_it) for doc in out_docs_test]
+
 
 # --------------------------------------------
 # 4) Ispezione a campione dei risultati del pre-processing
-print("\n4) Ispezione visiva a campione dei risultati del pre-processing")
 
-# Estrazione di 30 tweet dal train set
-campione = df_train.sample(n=30, random_state=42)
+def ispezione_campione(df_train: pd.DataFrame) -> None:
+    """Stampa 30 tweet del train set prima e dopo il pre-processing."""
+    print("\n4) Ispezione visiva a campione dei risultati del pre-processing")
 
-for index, row in campione.iterrows():
-    print(f"Tweet originale: {row['text']}")
-    print(f"Tweet dopo la pulizia: {row['text_clean']}")
-    print(f"Tweet dopo la pipeline Stanza: {row['text_ready']}")
-    print(f"Classe associata al Tweet: {'Positiva (1)' if row['label'] == 1 else 'Negativa (0)'}")
-    print("-" * 70)
+    # Estrazione di 30 tweet dal train set
+    campione = df_train.sample(n=30, random_state=42)
+
+    for index, row in campione.iterrows():
+        print(f"Tweet originale: {row['text']}")
+        print(f"Tweet dopo la pulizia: {row['text_clean']}")
+        print(f"Tweet dopo la pipeline Stanza: {row['text_ready']}")
+        print(f"Classe associata al Tweet: {'Positiva (1)' if row['label'] == 1 else 'Negativa (0)'}")
+        print("-" * 70)
 
 
 # --------------------------------------------
 # 5) Fase di Machine Learning: combinazione BoW e Tf-Idf, Naive Bayes e Logistic Regression
-print("\n5) Machine Learning e confronto sul f1-score")
-
-# Separazione "text" e "target"
-X_train_full = df_train['text_ready'].fillna('')
-y_train_full = df_train['label'].astype(int)
-X_test_final = df_test['text_ready'].fillna('')
-y_test_final = df_test['label'].astype(int)
-
-# Definizione della Pipeline di base
-pipeline = Pipeline([
-    ('vect', CountVectorizer()),
-    ('clf', MultinomialNB())
-])
 
 # Definizione dello spazio di ricerca per le 4 COMBINAZIONI (Il Quadrato Magico)
 param_grid = [
@@ -287,182 +324,259 @@ param_grid = [
     }
 ]
 
-print("Grid Search per trovare i migliori parametri dei 4 modelli, su una 5-Fold Cross-Validation")
-grid_search = GridSearchCV(pipeline, param_grid, cv=5, scoring='f1_macro', n_jobs=-1, verbose=1)
-grid_search.fit(X_train_full, y_train_full)
 
-# Conservazione del modello migliore, coi migliori parametri
-best_overall_model = grid_search.best_estimator_
-best_params = grid_search.best_params_
+def ricerca_modello(X_train_full: pd.Series, y_train_full: pd.Series) -> Pipeline:
+    """Grid Search con 5-fold cross-validation (F1-macro) sulle 4 combinazioni.
 
-# Estrazione dei nomi del vettorializzatore migliore e del classificatore migliore
-vect_name = "TF-IDF" if isinstance(best_overall_model.named_steps['vect'], TfidfVectorizer) else "Bag of Words (CountVectorizer)"
-clf_name = "Logistic Regression" if isinstance(best_overall_model.named_steps['clf'], LogisticRegression) else "Naive Bayes"
+    Restituisce la pipeline migliore, gia' addestrata su tutto il train set.
+    """
+    print("\n5) Machine Learning e confronto sul f1-score")
 
-print("\nRisultato della comparazione dei modelli:")
-print(f"Vettorializzatore migliore: {vect_name}")
-print(f"Classificatore migliore: {clf_name}")
-print(f"F1-Macro: {grid_search.best_score_:.4f}")
-print(f"Parametri migliori: {best_params}")
+    # Definizione della Pipeline di base
+    pipeline = Pipeline([
+        ('vect', CountVectorizer()),
+        ('clf', MultinomialNB())
+    ])
+
+    print("Grid Search per trovare i migliori parametri dei 4 modelli, su una 5-Fold Cross-Validation")
+    grid_search = GridSearchCV(pipeline, param_grid, cv=5, scoring='f1_macro', n_jobs=-1, verbose=1)
+    grid_search.fit(X_train_full, y_train_full)
+
+    # Conservazione del modello migliore, coi migliori parametri
+    best_overall_model = grid_search.best_estimator_
+    best_params = grid_search.best_params_
+
+    # Estrazione dei nomi del vettorializzatore migliore e del classificatore migliore
+    vect_name = "TF-IDF" if isinstance(best_overall_model.named_steps['vect'], TfidfVectorizer) else "Bag of Words (CountVectorizer)"
+    clf_name = "Logistic Regression" if isinstance(best_overall_model.named_steps['clf'], LogisticRegression) else "Naive Bayes"
+
+    print("\nRisultato della comparazione dei modelli:")
+    print(f"Vettorializzatore migliore: {vect_name}")
+    print(f"Classificatore migliore: {clf_name}")
+    print(f"F1-Macro: {grid_search.best_score_:.4f}")
+    print(f"Parametri migliori: {best_params}")
+
+    return best_overall_model
+
 
 # --------------------------------------------
 # 6) Prova sul test set e scelta della soglia
-print("\nProva sul test set col modello migliore")
 
-probability = best_overall_model.predict_proba(X_test_final)
-prob_classe_1 = probability[:, 1]
+def valuta_su_test(best_overall_model: Pipeline, X_test_final: pd.Series,
+                   y_test_final: pd.Series) -> np.ndarray:
+    """Valuta il modello sul test set con soglia 0,70 e restituisce le predizioni."""
+    print("\nProva sul test set col modello migliore")
 
-# Siccome il classificatore vincente si è dimostrato essere la Logistic Regression,
-# si lavora sulla sua soglia decisionale. Viene applicato un Threshold Moving dal 0.50 di default al 0.70, per rendere
-# il modello più conservativo, cercando i diminuire i Falsi Positivi derivanti da frase ironiche.
+    probability = best_overall_model.predict_proba(X_test_final)
+    prob_classe_1 = probability[:, 1]
 
-moved_threshold = 0.70
+    # Siccome il classificatore vincente si è dimostrato essere la Logistic Regression,
+    # si lavora sulla sua soglia decisionale. Viene applicato un Threshold Moving dal 0.50 di default al 0.70, per rendere
+    # il modello più conservativo, cercando di diminuire i Falsi Positivi derivanti da frasi ironiche.
 
-y_pred_final = (prob_classe_1 >= moved_threshold).astype(int)
+    moved_threshold = 0.70
 
-print(f"\nRisultati sul Test Set (Soglia {moved_threshold * 100}%):")
-print(classification_report(y_test_final, y_pred_final))
+    y_pred_final = (prob_classe_1 >= moved_threshold).astype(int)
 
-print("Matrice di Confusione:")
-print(confusion_matrix(y_test_final, y_pred_final))
+    print(f"\nRisultati sul Test Set (Soglia {moved_threshold * 100}%):")
+    print(classification_report(y_test_final, y_pred_final))
+
+    print("Matrice di Confusione:")
+    print(confusion_matrix(y_test_final, y_pred_final))
+
+    return y_pred_final
+
 
 # --------------------------------------------
 # 7) Analisi correlazione Falsi Positivi e Ironia
-print("\n7) Analisi correlazione Falsi Positivi e Ironia")
 
-# Creazione del DataFrame aggiungendo la colonna 'iro' da df_test
-df_errors = pd.DataFrame({
-    'Tweet originale': df_test['text'].values,
-    'Tweet dopo la pipeline Stanza': X_test_final.values,
-    'Classe target': y_test_final.values,
-    'Classe predetta': y_pred_final,  # <--- CORRETTO QUI
-    "Presenza d'ironia": df_test['iro'].astype(int).values
-})
+def analisi_ironia(df_test: pd.DataFrame, X_test_final: pd.Series,
+                   y_test_final: pd.Series, y_pred_final: np.ndarray) -> None:
+    """Confronta la quota di tweet ironici fra falsi positivi e veri negativi.
 
-## Falsi Positivi (target 0, previsto 1)
-falsi_positivi = df_errors[(df_errors['Classe target'] == 0) & (df_errors['Classe predetta'] == 1)]
+    Salva i falsi positivi, con i tweet ironici in testa, in
+    results/falsi_positivi_con_ironia.csv.
+    """
+    print("\n7) Analisi correlazione Falsi Positivi e Ironia")
 
-## Veri Negativi (target 0, previsto 0) per confrontare
-veri_negativi = df_errors[(df_errors['Classe target'] == 0) & (df_errors['Classe predetta'] == 0)]
+    # Creazione del DataFrame aggiungendo la colonna 'iro' da df_test
+    df_errors = pd.DataFrame({
+        'Tweet originale': df_test['text'].values,
+        'Tweet dopo la pipeline Stanza': X_test_final.values,
+        'Classe target': y_test_final.values,
+        'Classe predetta': y_pred_final,
+        "Presenza d'ironia": df_test['iro'].astype(int).values
+    })
 
-# Calcolo statistiche percentuali
-totale_fp = len(falsi_positivi)
-fp_ironici = falsi_positivi["Presenza d'ironia"].sum()
-perc_ironici_fp = (fp_ironici / totale_fp) * 100 if totale_fp > 0 else 0
+    ## Falsi Positivi (target 0, previsto 1)
+    falsi_positivi = df_errors[(df_errors['Classe target'] == 0) & (df_errors['Classe predetta'] == 1)]
 
-totale_tn = len(veri_negativi)
-tn_ironici = veri_negativi["Presenza d'ironia"].sum()
-perc_ironici_tn = (tn_ironici / totale_tn) * 100 if totale_tn > 0 else 0
+    ## Veri Negativi (target 0, previsto 0) per confrontare
+    veri_negativi = df_errors[(df_errors['Classe target'] == 0) & (df_errors['Classe predetta'] == 0)]
 
-# Risultati
-print(f"Risultato correlazione con ironia:")
-print(f"- Su {totale_fp} Falsi Positivi, {fp_ironici} contengono ironia ({perc_ironici_fp:.1f}%).")
-print(f"- Su {totale_tn} Veri Negativi, l'ironia è presente solo nel {perc_ironici_tn:.1f}%. (Gruppo di controllo)")
+    # Calcolo statistiche percentuali
+    totale_fp = len(falsi_positivi)
+    fp_ironici = falsi_positivi["Presenza d'ironia"].sum()
+    perc_ironici_fp = (fp_ironici / totale_fp) * 100 if totale_fp > 0 else 0
 
-# Verifica della correlazione
-if perc_ironici_fp > perc_ironici_tn:
-    rapporto = perc_ironici_fp / perc_ironici_tn if perc_ironici_tn > 0 else 0
-    print(f"L'ironia è {rapporto:.1f} volte più frequente nei tweet dove il modello sbaglia.")
+    totale_tn = len(veri_negativi)
+    tn_ironici = veri_negativi["Presenza d'ironia"].sum()
+    perc_ironici_tn = (tn_ironici / totale_tn) * 100 if totale_tn > 0 else 0
 
-# Creazione di un file contenente i risultati per ispezione
-nome_file = "falsi_positivi_con_ironia.csv"
-# Ordiniamo il file mettendo prima i tweet ironici, così balzano subito all'occhio; usato il separatore ";" per Excel
-falsi_positivi_ordinati = falsi_positivi.sort_values(by="Presenza d'ironia", ascending=False)
-falsi_positivi_ordinati.to_csv(nome_file, index=False, sep=';', encoding='utf-8-sig')
+    # Risultati
+    print(f"Risultato correlazione con ironia:")
+    print(f"- Su {totale_fp} Falsi Positivi, {fp_ironici} contengono ironia ({perc_ironici_fp:.1f}%).")
+    print(f"- Su {totale_tn} Veri Negativi, l'ironia è presente solo nel {perc_ironici_tn:.1f}%. (Gruppo di controllo)")
 
-print(f"\nFile salvato come {nome_file}")
+    # Verifica della correlazione
+    if perc_ironici_fp > perc_ironici_tn:
+        rapporto = perc_ironici_fp / perc_ironici_tn if perc_ironici_tn > 0 else 0
+        print(f"L'ironia è {rapporto:.1f} volte più frequente nei tweet dove il modello sbaglia.")
+
+    # Creazione di un file contenente i risultati per ispezione
+    CARTELLA_RISULTATI.mkdir(exist_ok=True)
+    nome_file = CARTELLA_RISULTATI / "falsi_positivi_con_ironia.csv"
+    # Ordiniamo il file mettendo prima i tweet ironici, così balzano subito all'occhio; usato il separatore ";" per Excel
+    falsi_positivi_ordinati = falsi_positivi.sort_values(by="Presenza d'ironia", ascending=False)
+    falsi_positivi_ordinati.to_csv(nome_file, index=False, sep=';', encoding='utf-8-sig')
+
+    print(f"\nFile salvato come {nome_file}")
+
 
 # --------------------------------------------
 # 8) Determinazione delle feature più influenti per classe
-print("\n8) Determinazione delle feature più influenti per classe e dei loro pesi")
 
-# Estrazione del vettorializzatore e del classificatore del modello migliore
-vect = best_overall_model.named_steps['vect']
-clf = best_overall_model.named_steps['clf']
-nomi_features = vect.get_feature_names_out()
+def feature_influenti(best_overall_model: Pipeline) -> pd.DataFrame:
+    """Stampa le parole e gli hashtag con i pesi piu' alti per ciascuna classe.
 
-# Estrazione dei pesi dal modello vincente
-pesi = clf.coef_[0]
+    Usa `coef_`, quindi presuppone che il modello migliore sia la Logistic
+    Regression. Restituisce la tabella di tutte le feature con il loro peso.
+    """
+    print("\n8) Determinazione delle feature più influenti per classe e dei loro pesi")
 
-# Creazione del DataFrame con tutte le parole e i rispettivi pesi
-df_features = pd.DataFrame({'Parola': nomi_features, 'Peso': pesi})
+    # Estrazione del vettorializzatore e del classificatore del modello migliore
+    vect = best_overall_model.named_steps['vect']
+    clf = best_overall_model.named_steps['clf']
+    nomi_features = vect.get_feature_names_out()
 
-# Le 20 parole più influenti per classe
-top_classe_1 = df_features.sort_values(by='Peso', ascending=False).head(20)
-top_classe_0 = df_features.sort_values(by='Peso', ascending=True).head(20)
+    # Estrazione dei pesi dal modello vincente
+    pesi = clf.coef_[0]
 
-print("\n Le 20 parole più influenti per la classe 1:")
-for _, row in top_classe_1.iterrows():
-    print(f"   {row['Parola']:<15} (Peso: {row['Peso']:+.4f})")
+    # Creazione del DataFrame con tutte le parole e i rispettivi pesi
+    df_features = pd.DataFrame({'Parola': nomi_features, 'Peso': pesi})
 
-print("\n Le 20 parole più influenti per la classe 0:")
-for _, row in top_classe_0.iterrows():
-    print(f"   {row['Parola']:<15} (Peso: {row['Peso']:+.4f})")
+    # Le 20 parole più influenti per classe
+    top_classe_1 = df_features.sort_values(by='Peso', ascending=False).head(20)
+    top_classe_0 = df_features.sort_values(by='Peso', ascending=True).head(20)
 
-# Analisi degli hashtag
-df_hashtags = df_features[df_features['Parola'].str.startswith('htag_')]
-top_htag_1 = df_hashtags.sort_values(by='Peso', ascending=False).head(20)
-top_htag_0 = df_hashtags.sort_values(by='Peso', ascending=True).head(20)
+    print("\n Le 20 parole più influenti per la classe 1:")
+    for _, row in top_classe_1.iterrows():
+        print(f"   {row['Parola']:<15} (Peso: {row['Peso']:+.4f})")
 
-print("\n I 20 hashtag più influenti per la classe 1:")
-for _, row in top_htag_1.iterrows():
-    print(f"   {row['Parola']:<20} (Peso: {row['Peso']:+.4f})")
+    print("\n Le 20 parole più influenti per la classe 0:")
+    for _, row in top_classe_0.iterrows():
+        print(f"   {row['Parola']:<15} (Peso: {row['Peso']:+.4f})")
 
-print("\n I 20 hashtag più influenti per la classe 0:")
-for _, row in top_htag_0.iterrows():
-    print(f"   {row['Parola']:<20} (Peso: {row['Peso']:+.4f})")
+    # Analisi degli hashtag
+    df_hashtags = df_features[df_features['Parola'].str.startswith('htag_')]
+    top_htag_1 = df_hashtags.sort_values(by='Peso', ascending=False).head(20)
+    top_htag_0 = df_hashtags.sort_values(by='Peso', ascending=True).head(20)
+
+    print("\n I 20 hashtag più influenti per la classe 1:")
+    for _, row in top_htag_1.iterrows():
+        print(f"   {row['Parola']:<20} (Peso: {row['Peso']:+.4f})")
+
+    print("\n I 20 hashtag più influenti per la classe 0:")
+    for _, row in top_htag_0.iterrows():
+        print(f"   {row['Parola']:<20} (Peso: {row['Peso']:+.4f})")
+
+    return df_features
+
 
 # --------------------------------------------
 # 9) Analisi del potere discriminativo di "!" e "?"
-print("\n Analisi del potere discriminativo di '!' e '?'")
-
-# Peso dato dal modello
-print("\n Pesi assegnati dal modello:")
-df_punct = df_features[df_features['Parola'].isin(['!', '?'])]
-
-if df_punct.empty:
-    print("I simboli '!' e '?' non sono presenti nel vocabolario del modello.")
-else:
-    for _, row in df_punct.iterrows():
-        segno = "Verso la classe 1" if row['Peso'] > 0 else "Verso la classe 0"
-        print(f"   Segno '{row['Parola']}': {row['Peso']:+.4f} -> Spinge {segno}")
-
-# Distribuzione nel training set
-print("\n Distribuzione nel training set:")
 
 # Funzione per contare la presenza del token
-def contiene_token(testo, token):
+def contiene_token(testo: str, token: str) -> int:
+    """1 se `token` compare fra le parole di `testo`, altrimenti 0."""
     parole = str(testo).split()
     return 1 if token in parole else 0
 
-# Calcolo per '!'
-df_train['punto_esclamativo'] = df_train['text_ready'].apply(lambda x: contiene_token(x, '!'))
-# Calcolo per '?'
-df_train['punto_interrogativo'] = df_train['text_ready'].apply(lambda x: contiene_token(x, '?'))
 
-# Raggruppamento per classe
-tot_classe_0 = len(df_train[df_train['label'] == 0])
-tot_classe_1 = len(df_train[df_train['label'] == 1])
+def analisi_punteggiatura(df_features: pd.DataFrame, df_train: pd.DataFrame) -> None:
+    """Confronta peso nel modello e frequenza per classe di "!" e "?"."""
+    print("\n Analisi del potere discriminativo di '!' e '?'")
 
-esc_0 = df_train[df_train['label'] == 0]['punto_esclamativo'].sum()
-esc_1 = df_train[df_train['label'] == 1]['punto_esclamativo'].sum()
+    # Peso dato dal modello
+    print("\n Pesi assegnati dal modello:")
+    df_punct = df_features[df_features['Parola'].isin(['!', '?'])]
 
-int_0 = df_train[df_train['label'] == 0]['punto_interrogativo'].sum()
-int_1 = df_train[df_train['label'] == 1]['punto_interrogativo'].sum()
-
-print(f"   Punto Esclamativo '!':")
-print(f"     - Presente nel {(esc_0/tot_classe_0)*100:.1f}% dei tweet negativi")
-print(f"     - Presente nel {(esc_1/tot_classe_1)*100:.1f}% dei tweet positivi")
-
-print(f"   Punto Interrogativo '?':")
-print(f"     - Presente nel {(int_0/tot_classe_0)*100:.1f}% dei tweet negativi")
-print(f"     - Presente nel {(int_1/tot_classe_1)*100:.1f}% dei tweet positivi")
-
-# Risultato
-print("\nRisultato:")
-for token, freq_0, freq_1 in [('!', esc_0/tot_classe_0, esc_1/tot_classe_1), ('?', int_0/tot_classe_0, int_1/tot_classe_1)]:
-    diff = abs(freq_0 - freq_1)
-    if diff > 0.10:
-        print(f"   -> il '{token}' ha un potere discriminativo.")
+    if df_punct.empty:
+        print("I simboli '!' e '?' non sono presenti nel vocabolario del modello.")
     else:
-        print(f"   -> il '{token}' è distribuito uniformemente.")
+        for _, row in df_punct.iterrows():
+            segno = "Verso la classe 1" if row['Peso'] > 0 else "Verso la classe 0"
+            print(f"   Segno '{row['Parola']}': {row['Peso']:+.4f} -> Spinge {segno}")
+
+    # Distribuzione nel training set
+    print("\n Distribuzione nel training set:")
+
+    # Calcolo per '!'
+    df_train['punto_esclamativo'] = df_train['text_ready'].apply(lambda x: contiene_token(x, '!'))
+    # Calcolo per '?'
+    df_train['punto_interrogativo'] = df_train['text_ready'].apply(lambda x: contiene_token(x, '?'))
+
+    # Raggruppamento per classe
+    tot_classe_0 = len(df_train[df_train['label'] == 0])
+    tot_classe_1 = len(df_train[df_train['label'] == 1])
+
+    esc_0 = df_train[df_train['label'] == 0]['punto_esclamativo'].sum()
+    esc_1 = df_train[df_train['label'] == 1]['punto_esclamativo'].sum()
+
+    int_0 = df_train[df_train['label'] == 0]['punto_interrogativo'].sum()
+    int_1 = df_train[df_train['label'] == 1]['punto_interrogativo'].sum()
+
+    print(f"   Punto Esclamativo '!':")
+    print(f"     - Presente nel {(esc_0/tot_classe_0)*100:.1f}% dei tweet negativi")
+    print(f"     - Presente nel {(esc_1/tot_classe_1)*100:.1f}% dei tweet positivi")
+
+    print(f"   Punto Interrogativo '?':")
+    print(f"     - Presente nel {(int_0/tot_classe_0)*100:.1f}% dei tweet negativi")
+    print(f"     - Presente nel {(int_1/tot_classe_1)*100:.1f}% dei tweet positivi")
+
+    # Risultato
+    print("\nRisultato:")
+    for token, freq_0, freq_1 in [('!', esc_0/tot_classe_0, esc_1/tot_classe_1), ('?', int_0/tot_classe_0, int_1/tot_classe_1)]:
+        diff = abs(freq_0 - freq_1)
+        if diff > 0.10:
+            print(f"   -> il '{token}' ha un potere discriminativo.")
+        else:
+            print(f"   -> il '{token}' è distribuito uniformemente.")
+
+
+def main() -> None:
+    """Esegue l'intera pipeline, dal download dei dati alle analisi finali."""
+    df_train, df_test = carica_dati()
+
+    print("\n2) Pulizia Testuale")
+    df_train['text_clean'] = df_train['text'].apply(pulizia_iniziale)
+    df_test['text_clean'] = df_test['text'].apply(pulizia_iniziale)
+
+    analisi_stanza(df_train, df_test)
+    ispezione_campione(df_train)
+
+    # Separazione "text" e "target"
+    X_train_full = df_train['text_ready'].fillna('')
+    y_train_full = df_train['label'].astype(int)
+    X_test_final = df_test['text_ready'].fillna('')
+    y_test_final = df_test['label'].astype(int)
+
+    best_overall_model = ricerca_modello(X_train_full, y_train_full)
+    y_pred_final = valuta_su_test(best_overall_model, X_test_final, y_test_final)
+    analisi_ironia(df_test, X_test_final, y_test_final, y_pred_final)
+    df_features = feature_influenti(best_overall_model)
+    analisi_punteggiatura(df_features, df_train)
+
+
+if __name__ == "__main__":
+    main()
